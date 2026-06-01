@@ -1,46 +1,141 @@
-# dawg [![GoDoc](https://godoc.org/github.com/smhanov/dawg?status.svg)](https://godoc.org/github.com/smhanov/dawg)
-[![CircleCI](https://circleci.com/gh/smhanov/dawg.svg?style=svg)](https://circleci.com/gh/smhanov/dawg)
-Package dawg is an implemention of a Directed Acyclic Word Graph, as described on my blog at http://stevehanov.ca/blog/?id=115 It is designed to be as memory efficient as possible.
+# DAWG of DAFSA with compact alphabet
 
-Download:
+Package `dafsa` is an implementation of a Directed Acyclic Word Graph (DAWG), a
+minimized [DAFSA](https://en.wikipedia.org/wiki/Deterministic_acyclic_finite_state_automaton),
+built with the incremental-minimization algorithm described on
+[Steve Hanov's blog](http://stevehanov.ca/blog/?id=115). It is designed to be as
+memory efficient as possible.
+
+A DAWG provides fast lookup of all the prefixes of a word that are themselves
+stored words, as well as the index number of any stored word (and the reverse).
+
+This fork differs from the original in two ways:
+
+- **Compact alphabet.** Characters are stored as
+  [`alphabet.Indexer`](https://github.com/iliadenisov/alphabet) indexes (0–62,
+  at most six bits) instead of raw runes. This shrinks the graph and binds every
+  word to a known alphabet, so ordering and validity are well defined.
+- **Index-based API.** Every query has a string form (convenient) and a `*B`
+  form that works directly on alphabet indexes, skipping per-call
+  encoding/decoding on hot paths.
+
+The storage format packs bits instead of bytes, so no space is wasted as
+padding and there is no practical limit on the number of nodes or characters. A
+summary of the data format is at the top of `disk.go`.
+
+## Installation
+
 ```shell
-go get github.com/smhanov/dawg
+go get github.com/iliadenisov/dafsa
 ```
 
-* * *
-Package dawg is an implemention of a Directed Acyclic Word Graph, as described
-on my blog at http://stevehanov.ca/blog/?id=115
+## Usage
 
-A DAWG provides fast lookup of all possible prefixes of words in a dictionary, as well
-as the ability to get the index number of any word.
+Create a builder with `dawg.New(indexer)`, passing an `alphabet.Indexer` that
+fixes the alphabet (for example `alphabet.Latin()`). Add words, call `Finish()`,
+then query the returned `Finder`.
 
-This particular implementation may be different from others because it is very memory
-efficient, and it also works fast with large character sets. It can deal with
-thousands of branches out of a single node without needing to go through each one.
+```go
+d := dawg.New(alphabet.Latin())
+_ = d.Add("blip")   // index 0
+_ = d.Add("cat")    // index 1
+_ = d.Add("catnip") // index 2
+_ = d.Add("cats")   // index 3
 
-The storage format is as small as possible. Bits are used instead of bytes so that
-no space is wasted as padding, and there are no practical limitations to the number of
-nodes or characters. A summary of the data format is found at the top of disk.go.
+finder := d.Finish()
 
-In general, to use it you first create a builder using dawg.New(). You can then
-add words to the Dawg. The two restrictions are that you cannot repeat a word, and
-they must be in strictly increasing alphabetical order.
+results, _ := finder.FindAllPrefixesOf("catsup")
+for _, r := range results {
+    fmt.Printf("%s -> %d\n", r.Word, r.Index) // cat -> 1, cats -> 3
+}
+```
 
-After all the words are added, call Finish() which returns a dawg.Finder interface.
-You can perform queries with this interface, such as finding all prefixes of a given string
-which are also words, or looking up a word's index that you have previously added.
+`IndexOf`, `FindAllPrefixesOf` and `Add` return an error when the input contains
+a character outside the alphabet. `IndexOf` returns `(-1, nil)` for a word that
+is simply absent.
 
-After you have called Finish() on a Builder, you may choose to write it to disk using the
-Save() function. The DAWG can then be opened again later using the Load() function.
-When opened from disk, no memory is used. The structure is accessed in-place on disk.
+### Index-based (fast) API
 
-## Benchmarks
+When you already hold alphabet indexes — or you are on a hot path and want to
+avoid encoding the query every call — use the `*B` methods. They take and
+return `[]byte` indexes and do no encoding or decoding:
 
-There are some benchmarks in this project:
+```go
+word, _ := alphabet.Latin().Encode("cats")
+i := finder.IndexOfB(word)             // 3
+prefixes := finder.FindAllPrefixesOfB(word)
+idxs, _ := finder.AtIndexB(3)          // []byte{2,0,19,18}
+finder.EnumerateB(func(index int, w []byte, final bool) int {
+    return dawg.Continue
+})
+```
 
-https://github.com/timurgarif/go-fsa-trie-bench
+The builder exposes `AddB` and `CanAddB` for the same reason.
 
-The library is optimized to take less memory or no-memory if accessing a file. We easily beat all 
-the alternatives in this area, using only 520KB compared to others which take from 3.6MB to 32MB 
-to store the same dictionary. However, the tradeoff is that  the bit-level accesses cause it to 
-take 10X as along to lookup words. 
+## Alphabet and ordering
+
+Words must be added in strictly increasing order **by alphabet index**, which is
+not necessarily Unicode code-point order. For example, in the embedded Russian
+alphabet `ё` has index 6 (right after `е`), even though its code point is greater
+than `я`. Reusing a word, or adding one out of order, is rejected.
+
+## Persistence
+
+After `Finish()` you may write the DAWG with `Save()` and reopen it later with
+`Load()`. When opened from a file the structure is accessed in place, using no
+heap memory for the graph itself.
+
+The file stores the alphabet's **language code**, and `Load`/`Read` reconstruct
+the alphabet from it via `alphabet.LoadEmbedded`. Consequently only
+embedded-language alphabets can be saved and reloaded; `Save` refuses a custom
+(non-embedded) alphabet up front, and `Load` returns an error if the stored code
+is unknown. Custom alphabets still work fully in memory.
+
+## Performance vs the base (rune-based) version
+
+Measured on the same deterministic 20,000-word lowercase Latin corpus
+(`go test -bench . -benchmem -count=3`, Go 1.26). "Base" is the previous
+rune-based implementation; "string" and "bytes" are this version's two API forms.
+
+Size and memory:
+
+| Metric                        | Base (rune) | This version |
+| ----------------------------- | ----------- | ------------ |
+| Serialized file               | 164,997 B   | 152,064 B (**−7.8 %**) |
+| Bits per character (`cbits`)  | 7           | 5            |
+
+The per-character saving grows for larger alphabets: Cyrillic drops from 11 to 6
+bits per character, for example.
+
+Lookup time and allocations (`ns/op`, `allocs/op`):
+
+| Operation          | Base (rune)      | This (string)    | This (bytes)     |
+| ------------------ | ---------------- | ---------------- | ---------------- |
+| Build (20k words)  | 37.1 ms / 548k   | 37.0 ms / 536k   | 35.7 ms / 516k   |
+| IndexOf            | 349 ns / 1       | 409 ns / 2       | **350 ns / 1**   |
+| FindAllPrefixesOf  | 380 ns / 2       | 515 ns / 5       | **380 ns / 2**   |
+| AtIndex            | 2159 ns / 24     | 1544 ns / 10     | **1500 ns / 8**  |
+| Enumerate (all)    | 5.01 ms / 99.7k  | 4.63 ms / 72.3k  | **4.24 ms / 72.3k** |
+
+Takeaways:
+
+- The `*B` lookups match or beat the base version while storing a smaller
+  graph; lookup time is bounded by the bit-level reads (a deliberate design
+  trade-off), so the smaller `cbits` helps more for larger alphabets and big,
+  cache-bound dictionaries.
+- The string methods add the cost of encoding the query through the alphabet;
+  prefer the `*B` forms on hot paths.
+- `AtIndex` and `Enumerate` are markedly faster and allocate far less, because
+  nodes are now decoded into exact-size buffers.
+
+## Comparison with other libraries
+
+The library trades lookup speed for size. Against other Go FSA/trie
+implementations ([go-fsa-trie-bench](https://github.com/timurgarif/go-fsa-trie-bench))
+it stores the same dictionary in a fraction of the memory (hundreds of KB versus
+several MB to tens of MB), at the cost of slower, bit-level lookups.
+
+## Credits
+
+Based on the DAWG implementation and incremental-minimization write-up by
+[Steve Hanov](http://stevehanov.ca/blog/?id=115). See `LICENSE`.

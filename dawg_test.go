@@ -3,68 +3,66 @@ package dawg_test
 import (
 	"bufio"
 	"fmt"
-	"log"
 	"os"
-	"sort"
+	"path/filepath"
+	"slices"
 	"testing"
 
-	"github.com/smhanov/dawg"
+	"github.com/iliadenisov/alphabet"
+	dawg "github.com/iliadenisov/dafsa"
 )
 
-func testsWords() []string {
-	return []string{
-		"hello",
-		"jellow",
-	}
-}
-
-func createDawg(words []string) dawg.Finder {
-	dawg := dawg.New()
+func createDawg(t *testing.T, words []string) dawg.Finder {
+	t.Helper()
+	d := dawg.New(alphabet.Latin())
 	for _, word := range words {
-		dawg.Add(word)
+		if err := d.Add(word); err != nil {
+			t.Fatalf("Add(%q) returned error: %v", word, err)
+		}
 	}
 
-	return dawg.Finish()
+	return d.Finish()
 }
 
-func testDawg(t *testing.T, dawg dawg.Finder, words []string) {
-	added := dawg.NumAdded()
+func testDawg(t *testing.T, finder dawg.Finder, words []string) {
+	t.Helper()
+	added := finder.NumAdded()
 	if added != len(words) {
 		t.Errorf("NumWords() returned %d, expected %d", added, len(words))
 	}
 
 	for i, word := range words {
-		index := dawg.IndexOf(word)
-
-		if index != i {
-			log.Panicf("Index returned should be %v, not %v", i, index)
+		index, err := finder.IndexOf(word)
+		if err != nil {
+			t.Fatalf("IndexOf(%q) returned error: %v", word, err)
 		}
 
-		wordFound, _ := dawg.AtIndex(i)
+		if index != i {
+			t.Fatalf("Index returned should be %v, not %v", i, index)
+		}
+
+		wordFound, _ := finder.AtIndex(i)
 		if wordFound != word {
-			log.Panicf("AtIndex(%d) should be %s, not %s", i, word, wordFound)
+			t.Fatalf("AtIndex(%d) should be %s, not %s", i, word, wordFound)
 		}
 	}
 }
 
 func runTest(t *testing.T, words []string) dawg.Finder {
-	finder := createDawg(words)
-	//finder.Print()
+	d := t.ArtifactDir()
+	path := filepath.Join(d, "test.dawg")
+
+	finder := createDawg(t, words)
 	testDawg(t, finder, words)
 
-	// Now try the disk version
-	_, err := finder.Save("test.dawg")
+	_, err := finder.Save(path)
 	if err != nil {
-		log.Panic(err)
+		t.Fatal(err)
 	}
 
-	//f, err := os.Open("test.dawg")
-	//dawg.DumpFile(f)
-	//f.Close()
-
-	saved, err := dawg.Load("test.dawg")
+	saved, err := dawg.Load(path)
 	if err != nil {
-		log.Panic(err)
+		t.Fatal(err)
 	}
 
 	testDawg(t, saved, words)
@@ -102,9 +100,12 @@ func Test5Words(t *testing.T) {
 }
 
 func testPrefixes(t *testing.T, words []string, word string, shouldbe []dawg.FindResult) {
-	finder := createDawg(words)
+	finder := createDawg(t, words)
 
-	results := finder.FindAllPrefixesOf(word)
+	results, err := finder.FindAllPrefixesOf(word)
+	if err != nil {
+		t.Fatalf("FindAllPrefixesOf(%q) returned error: %v", word, err)
+	}
 
 	if len(results) != len(shouldbe) {
 		t.Errorf("Got %v but should be %v", results, shouldbe)
@@ -134,6 +135,20 @@ func TestPrefixes(t *testing.T) {
 	})
 }
 
+// isLatinLower reports whether word is non-empty and consists only of the
+// lowercase ASCII letters a-z, i.e. exactly the characters of alphabet.Latin().
+func isLatinLower(word string) bool {
+	if word == "" {
+		return false
+	}
+	for i := 0; i < len(word); i++ {
+		if word[i] < 'a' || word[i] > 'z' {
+			return false
+		}
+	}
+	return true
+}
+
 func readDictWords(t *testing.T) []string {
 	dict := "/usr/share/dict/words"
 	if _, err := os.Stat(dict); os.IsNotExist(err) {
@@ -143,19 +158,27 @@ func readDictWords(t *testing.T) []string {
 
 	file, err := os.Open(dict)
 	if err != nil {
-		log.Fatal(err)
+		t.Fatal(err)
 	}
 	defer file.Close()
 
 	var words []string
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
-		words = append(words, scanner.Text())
+		// Keep only words expressible in alphabet.Latin(); the system
+		// dictionary also contains capitalized and apostrophed entries.
+		if word := scanner.Text(); isLatinLower(word) {
+			words = append(words, word)
+		}
 	}
 
-	sort.Slice(words, func(i, j int) bool {
-		return words[i] < words[j]
-	})
+	// For the a-z Latin alphabet the index order equals byte order, so a plain
+	// string sort yields the required increasing alphabet order.
+	slices.Sort(words)
+
+	if len(words) == 0 {
+		return nil
+	}
 
 	var unique []string
 	unique = append(unique, words[0])
@@ -169,9 +192,12 @@ func readDictWords(t *testing.T) []string {
 
 func TestFullDict(t *testing.T) {
 	words := readDictWords(t)
-	dawg := runTest(t, words)
+	if len(words) == 0 {
+		t.Skip("no usable dictionary words")
+	}
+	finder := runTest(t, words)
 	t.Logf("DAWG has %v words, %v nodes, %v edges",
-		dawg.NumAdded(), dawg.NumNodes(), dawg.NumEdges())
+		finder.NumAdded(), finder.NumNodes(), finder.NumEdges())
 }
 
 func TestEnumerate(t *testing.T) {
@@ -184,7 +210,7 @@ func TestEnumerate(t *testing.T) {
 		"zzz",
 	}
 
-	finder := createDawg(words)
+	finder := createDawg(t, words)
 	finder.Print()
 
 	total := 0
@@ -224,16 +250,17 @@ func TestEnumerate(t *testing.T) {
 }
 
 func ExampleNew() {
-	dawg := dawg.New()
+	d := dawg.New(alphabet.Latin())
 
-	dawg.Add("blip")   // index 0
-	dawg.Add("cat")    // index 1
-	dawg.Add("catnip") // index 2
-	dawg.Add("cats")   // index 3
+	d.Add("blip")   // index 0
+	d.Add("cat")    // index 1
+	d.Add("catnip") // index 2
+	d.Add("cats")   // index 3
 
-	finder := dawg.Finish()
+	finder := d.Finish()
 
-	for _, result := range finder.FindAllPrefixesOf("catsup") {
+	results, _ := finder.FindAllPrefixesOf("catsup")
+	for _, result := range results {
 		fmt.Printf("Found prefix %s, index %d\n", result.Word, result.Index)
 	}
 

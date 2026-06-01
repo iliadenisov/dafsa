@@ -8,6 +8,7 @@ import (
 	"math/bits"
 	"os"
 
+	"github.com/iliadenisov/alphabet"
 	"golang.org/x/exp/mmap"
 )
 
@@ -15,6 +16,9 @@ import (
 - 4 bytes - total size of file
 - 1 byte: cbits
 - 1 byte: abits
+- 7code - length of the alphabet language code in bytes
+- that many bytes: the alphabet language code (UTF-8), used by Load/Read to
+  reconstruct the alphabet.Indexer.
 - 7code - number of words
 - 7code - number of nodes
 - 7code - number of edges
@@ -45,11 +49,20 @@ for {
 	if data & 0x80 == 0 break
 }
 
+The character stored in cbits is the alphabet index (0..62) of the character,
+not its Unicode code point.
 */
 
 // Save writes the dawg to disk. Returns the number of bytes written
 func (d *dawg) Save(filename string) (int64, error) {
 	d.checkFinished()
+
+	if d.indexer != nil {
+		code := d.indexer.Lang().Code()
+		if _, err := alphabet.NewLang(code); err != nil {
+			return 0, fmt.Errorf("dawg: cannot save: alphabet language %q is not embedded and could not be reloaded by Load: %w", code, err)
+		}
+	}
 
 	f, err := os.Create(filename)
 	if err != nil {
@@ -60,16 +73,15 @@ func (d *dawg) Save(filename string) (int64, error) {
 	return d.Write(f)
 }
 
-func readUint32(r io.ReaderAt, at int64) uint32 {
-	data := make([]byte, 4, 4)
-	_, err := r.ReadAt(data, at)
-	if err != nil {
-		log.Panic(err)
+func readUint32(r io.ReaderAt, at int64) (uint32, error) {
+	data := make([]byte, 4)
+	if _, err := r.ReadAt(data, at); err != nil {
+		return 0, err
 	}
 	return (uint32(data[0]) << 24) |
 		(uint32(data[1]) << 16) |
 		(uint32(data[2]) << 8) |
-		(uint32(data[3]) << 0)
+		(uint32(data[3]) << 0), nil
 }
 
 func (n *node) isFallthrough(id int) bool {
@@ -90,8 +102,8 @@ func (d *dawg) Write(wIn io.Writer) (int64, error) {
 
 	// get maximum character and calculate cbits
 	// record node addresses, calculate counts and number of edges
-	addresses := make([]uint64, d.NumNodes(), d.NumNodes())
-	var maxChar rune
+	addresses := make([]uint64, d.NumNodes())
+	var maxChar byte
 	for _, node := range d.nodes {
 		for _, edge := range node.edges {
 			if edge.ch > maxChar {
@@ -104,12 +116,18 @@ func (d *dawg) Write(wIn io.Writer) (int64, error) {
 	wbits := uint64(bits.Len(uint(d.NumAdded())))
 	nskiplen := uint64(bits.Len(uint(wbits)))
 
+	// the language code is stored so Load can reconstruct the alphabet.
+	codeBytes := []byte(d.indexer.Lang().Code())
+
 	// let abits = 1
 	abits := uint64(1)
 	var pos uint64
 	for {
-		// position = 32 + 8 + 8 + encoded length of number of words, nodes, and edges
+		// position = 32 + 8 + 8 + language code + encoded length of number of
+		// words, nodes, and edges
 		pos = 32 + 8 + 8
+		pos += unsignedLength(uint64(len(codeBytes))) * 8
+		pos += uint64(len(codeBytes)) * 8
 		pos += unsignedLength(uint64(d.NumAdded())) * 8
 		pos += unsignedLength(uint64(d.NumNodes())) * 8
 		pos += unsignedLength(uint64(d.NumEdges())) * 8
@@ -173,6 +191,12 @@ func (d *dawg) Write(wIn io.Writer) (int64, error) {
 	w.WriteBits(size, 32)
 	w.WriteBits(cbits, 8)
 	w.WriteBits(abits, 8)
+
+	// write the language code
+	writeUnsigned(w, uint64(len(codeBytes)))
+	for _, b := range codeBytes {
+		w.WriteBits(uint64(b), 8)
+	}
 
 	// write number of words, nodes, and edges.
 	writeUnsigned(w, uint64(d.NumAdded()))
@@ -241,12 +265,21 @@ func Load(filename string) (Finder, error) {
 	return Read(f, 0)
 }
 
-const edgesOffset = (32*4 + 8 + 8)
-
-// Read returns a finder that accesses the dawg in-place using the
-// given io.ReaderAt
+// Read returns a finder that accesses the dawg in-place using the given
+// io.ReaderAt. The alphabet is reconstructed from the language code stored in
+// the file; it returns an error when that language is not an embedded alphabet.
 func Read(f io.ReaderAt, offset int64) (Finder, error) {
-	size := readUint32(f, offset)
+	return read(f, offset, nil)
+}
+
+// read parses the dawg at offset. When idx is non-nil it is used as the
+// alphabet and the language code in the file is skipped; when idx is nil the
+// alphabet is reconstructed from the stored language code.
+func read(f io.ReaderAt, offset int64, idx alphabet.Indexer) (Finder, error) {
+	size, err := readUint32(f, offset)
+	if err != nil {
+		return nil, fmt.Errorf("dawg: cannot read header: %w", err)
+	}
 	if offset != 0 {
 		f = io.NewSectionReader(f, offset, int64(size))
 	}
@@ -256,6 +289,19 @@ func Read(f io.ReaderAt, offset int64) (Finder, error) {
 	r.Seek(32, 0)
 	cbits := r.ReadBits(8)
 	abits := r.ReadBits(8)
+	code := readString(&r)
+
+	if idx == nil {
+		lang, err := alphabet.NewLang(code)
+		if err != nil {
+			return nil, fmt.Errorf("dawg: file uses unknown alphabet language %q: %w", code, err)
+		}
+		idx, err = alphabet.LoadEmbedded(lang)
+		if err != nil {
+			return nil, fmt.Errorf("dawg: cannot load embedded alphabet %q: %w", code, err)
+		}
+	}
+
 	numAdded := int(readUnsigned(&r))
 	numNodes := int(readUnsigned(&r))
 	numEdges := int(readUnsigned(&r))
@@ -263,6 +309,7 @@ func Read(f io.ReaderAt, offset int64) (Finder, error) {
 	hasEmpty := r.ReadBits(1) == 1
 	wbits := int64(bits.Len(uint(numAdded)))
 	dawg := &dawg{
+		indexer:         idx,
 		finished:        true,
 		numAdded:        numAdded,
 		numNodes:        numNodes,
@@ -275,8 +322,23 @@ func Read(f io.ReaderAt, offset int64) (Finder, error) {
 		r:               f,
 		size:            int64(size),
 	}
+	dawg.buildDecoder()
 
 	return dawg, nil
+}
+
+// readString reads a 7code length followed by that many 8-bit bytes and returns
+// them as a string.
+func readString(r *bitSeeker) string {
+	n := readUnsigned(r)
+	if n == 0 {
+		return ""
+	}
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = byte(r.ReadBits(8))
+	}
+	return string(b)
 }
 
 // Close ...
@@ -302,7 +364,7 @@ func (d *dawg) getEdge(r *bitSeeker, eStart edgeStart) (edgeEnd, bool, bool) {
 		fallthr := int(r.ReadBits(1))
 
 		if fallthr == 1 {
-			ch := rune(r.ReadBits(d.cbits))
+			ch := byte(r.ReadBits(d.cbits))
 			if ch == eStart.ch {
 				edgeEnd.count = nodeFinal
 				edgeEnd.node = int(r.Tell())
@@ -327,7 +389,7 @@ func (d *dawg) getEdge(r *bitSeeker, eStart edgeStart) (edgeEnd, bool, bool) {
 				}
 
 				r.Seek(seekTo, 0)
-				ch := rune(r.ReadBits(d.cbits))
+				ch := byte(r.ReadBits(d.cbits))
 				if ch == eStart.ch {
 					if i > 0 {
 						edgeEnd.count = int(r.ReadBits(nskip))
@@ -339,7 +401,7 @@ func (d *dawg) getEdge(r *bitSeeker, eStart edgeStart) (edgeEnd, bool, bool) {
 					final = r.ReadBits(1) == 1
 					ok = true
 				}
-				return int(ch - eStart.ch)
+				return int(ch) - int(eStart.ch)
 			})
 		}
 	}
@@ -354,7 +416,7 @@ type nodeResult struct {
 }
 
 type edgeResult struct {
-	ch    rune
+	ch    byte
 	count int
 	node  int
 }
@@ -375,36 +437,40 @@ func (d *dawg) getNode(r *bitSeeker, node int) nodeResult {
 	result.final = nodeFinal == 1
 
 	if fallthr == 1 {
-		result.edges = append(result.edges, edgeResult{
-			ch:    rune(r.ReadBits(d.cbits)),
+		result.edges = []edgeResult{{
+			ch:    byte(r.ReadBits(d.cbits)),
 			count: int(nodeFinal),
 			node:  int(r.Tell()),
-		})
-	} else {
-		nskiplen := int64(bits.Len(uint(d.wbits)))
-		nskip := int64(0)
+		}}
+		return result
+	}
 
-		singleEdge := r.ReadBits(1)
-		numEdges := uint64(1)
-		if singleEdge != 1 {
-			numEdges = readUnsigned(r)
-			nskip = int64(r.ReadBits(nskiplen))
+	nskiplen := int64(bits.Len(uint(d.wbits)))
+	nskip := int64(0)
+
+	singleEdge := r.ReadBits(1)
+	numEdges := uint64(1)
+	if singleEdge != 1 {
+		numEdges = readUnsigned(r)
+		nskip = int64(r.ReadBits(nskiplen))
+	}
+
+	// Allocate the edge slice at its exact size to avoid append regrowth; this
+	// is the dominant allocation on the AtIndex and Enumerate paths.
+	result.edges = make([]edgeResult, numEdges)
+	for i := uint64(0); i < numEdges; i++ {
+		ch := r.ReadBits(int64(d.cbits))
+		var count uint64
+		if i > 0 {
+			count = r.ReadBits(int64(nskip))
+		} else {
+			count = nodeFinal
 		}
-
-		for i := uint64(0); i < numEdges; i++ {
-			ch := r.ReadBits(int64(d.cbits))
-			var count uint64
-			if i > 0 {
-				count = r.ReadBits(int64(nskip))
-			} else {
-				count = nodeFinal
-			}
-			address := r.ReadBits(int64(d.abits))
-			result.edges = append(result.edges, edgeResult{
-				ch:    rune(ch),
-				count: int(count),
-				node:  int(address),
-			})
+		address := r.ReadBits(int64(d.abits))
+		result.edges[i] = edgeResult{
+			ch:    byte(ch),
+			count: int(count),
+			node:  int(address),
 		}
 	}
 	return result
@@ -420,7 +486,33 @@ func DumpFile(f io.ReaderAt) {
 	fmt.Printf("[%08x] cbits=%d\n", r.Tell()-8, cbits)
 
 	abits := r.ReadBits(8)
-	fmt.Printf("[%08x] abits=%d\n", r.Tell()-8, cbits)
+	fmt.Printf("[%08x] abits=%d\n", r.Tell()-8, abits)
+
+	codeAt := r.Tell()
+	code := readString(&r)
+	fmt.Printf("[%08x] lang=%q\n", codeAt, code)
+
+	// Build a decoder for nicer character output, falling back to numeric
+	// indexes when the alphabet cannot be reconstructed.
+	var decoder []rune
+	if lang, err := alphabet.NewLang(code); err == nil {
+		if idx, err := alphabet.LoadEmbedded(lang); err == nil {
+			decoder = make([]rune, idx.Size())
+			for i := range decoder {
+				if s, err := idx.Character(byte(i)); err == nil {
+					if rs := []rune(s); len(rs) > 0 {
+						decoder[i] = rs[0]
+					}
+				}
+			}
+		}
+	}
+	glyph := func(ix uint64) string {
+		if int(ix) < len(decoder) {
+			return string(decoder[ix])
+		}
+		return fmt.Sprintf("#%d", ix)
+	}
 
 	wordCount := readUnsigned(&r)
 	fmt.Printf("[%08x] WordCount=%v\n", r.Tell()-int64(unsignedLength(wordCount)*8), wordCount)
@@ -441,7 +533,7 @@ func DumpFile(f io.ReaderAt) {
 
 		if fallthr == 1 {
 			ch := r.ReadBits(int64(cbits))
-			fmt.Printf("[%08x] Node final=%d ch='%c' (fallthrough)\n", at, final, rune(ch))
+			fmt.Printf("[%08x] Node final=%d ch='%s' (fallthrough)\n", at, final, glyph(ch))
 			continue
 		}
 
@@ -465,24 +557,24 @@ func DumpFile(f io.ReaderAt) {
 				count = final
 			}
 			address := r.ReadBits(int64(abits))
-			fmt.Printf("[%08x] '%c' goto <%08x> skipping %d\n",
-				at, rune(ch), address, count)
+			fmt.Printf("[%08x] '%s' goto <%08x> skipping %d\n",
+				at, glyph(ch), address, count)
 		}
 
 	}
 }
 
 func writeUnsigned(w *bitWriter, n uint64) {
-	if n < 0x7f {
+	if n < 0x80 {
 		w.WriteBits(n, 8)
-	} else if n < 0x3fff {
+	} else if n < 0x4000 {
 		w.WriteBits((n>>7)&0x7f|0x80, 8)
 		w.WriteBits(n&0x7f, 8)
-	} else if n < 0x1fffff {
+	} else if n < 0x200000 {
 		w.WriteBits((n>>14)&0x7f|0x80, 8)
 		w.WriteBits((n>>7)&0x7f|0x80, 8)
 		w.WriteBits(n&0x7f, 8)
-	} else if n < 0xfffffff {
+	} else if n < 0x10000000 {
 		w.WriteBits((n>>21)&0x7f|0x80, 8)
 		w.WriteBits((n>>14)&0x7f|0x80, 8)
 		w.WriteBits((n>>7)&0x7f|0x80, 8)
@@ -506,13 +598,13 @@ func readUnsigned(r *bitSeeker) uint64 {
 }
 
 func unsignedLength(n uint64) uint64 {
-	if n < 0x7f {
+	if n < 0x80 {
 		return 1
-	} else if n < 0x3fff {
+	} else if n < 0x4000 {
 		return 2
-	} else if n < 0x1fffff {
+	} else if n < 0x200000 {
 		return 3
-	} else if n < 0xfffffff {
+	} else if n < 0x10000000 {
 		return 4
 	}
 	log.Panicf("Not implemented: %d", n)

@@ -1,5 +1,8 @@
-module github.com/smhanov/dawg
+module github.com/iliadenisov/dafsa
 
-go 1.15
+go 1.26
 
-require golang.org/x/exp v0.0.0-20201008143054-e3b2a7f2fdc7
+require (
+	github.com/iliadenisov/alphabet v1.1.0
+	golang.org/x/exp v0.0.0-20201008143054-e3b2a7f2fdc7
+)
