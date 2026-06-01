@@ -7,6 +7,8 @@ import (
 	"io"
 	"log"
 	"strconv"
+
+	"github.com/iliadenisov/alphabet"
 )
 
 // FindResult is the result of a lookup in the d. It
@@ -116,6 +118,9 @@ type node struct {
 
 // dawg represents a Directed Acyclic Word Graph
 type dawg struct {
+	// TODO: indexer used for check correctess of added/searched words
+	indexer alphabet.Indexer
+
 	// these are erased after we finish building
 	lastWord       []rune
 	nextID         int
@@ -335,7 +340,6 @@ func (d *dawg) IndexOf(input string) int {
 	for _, letter := range input {
 		// check if there is an outgoing edge for the letter
 		edgeEnd, final, ok = d.getEdge(&r, edgeStart{node: node, ch: letter})
-		//log.Printf("Follow %v:%v=>%v (ok=%v)", node, string(letter), edgeEnd.node, ok)
 		if !ok {
 			// not found
 			return -1
@@ -424,7 +428,6 @@ func (d *dawg) setFinal(node int) {
 }
 
 func (d *dawg) addChild(parent int, ch rune, child int) {
-	//log.Printf("Addchild %v(%v)->%v", parent, string(ch), child)
 	d.numEdges++
 	if d.nodes[child] == nil {
 		d.nodes[child] = &node{
@@ -440,21 +443,14 @@ func (d *dawg) addChild(parent int, ch rune, child int) {
 
 func (d *dawg) replaceChild(parent int, ch rune, child int) {
 	pnode := d.nodes[parent]
-	//TODO: should be bsearch
+
 	i := bsearch(len(pnode.edges), func(i int) int {
 		return int(pnode.edges[i].ch - ch)
 	})
 
 	if pnode.edges[i].ch != ch {
-		//for _, edge := range pnode.edges {
-		//	log.Printf("Edge %c %d", rune(edge.ch), edge.node)
-		//}
 		log.Panicf("Not found: %c", ch)
 	}
-
-	//log.Printf("ReplaceChild(%v:%v=>%v, %v:%v=>%v)",
-	//	parent, string(ch), pnode.edges[i].node,
-	//	parent, string(ch), child)
 
 	delete(d.nodes, pnode.edges[i].node)
 	pnode.edges[i].node = child
@@ -523,13 +519,6 @@ func (d *dawg) enumerate(r *bitSeeker, index int, address int, runes []rune, fn 
 	return result
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
 func (d *dawg) AtIndex(index int) (string, error) {
 	if index < 0 || index >= d.NumAdded() {
 		return "", errors.New("invalid index")
@@ -556,7 +545,6 @@ func (d *dawg) atIndex(r *bitSeeker, nodeNumber, atIndex, targetIndex int, runes
 		next--
 	}
 
-	//log.Printf("Follow edge %v %c skip=%d", node.edges[next], node.edges[next].ch, node.edges[next].count)
 	runes = append(runes, 0)
 	for i := next; i < len(node.edges); i++ {
 		runes[len(runes)-1] = node.edges[i].ch

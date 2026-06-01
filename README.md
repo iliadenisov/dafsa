@@ -1,15 +1,19 @@
-# dawg [![GoDoc](https://godoc.org/github.com/smhanov/dawg?status.svg)](https://godoc.org/github.com/smhanov/dawg)
-[![CircleCI](https://circleci.com/gh/smhanov/dawg.svg?style=svg)](https://circleci.com/gh/smhanov/dawg)
-Package dawg is an implemention of a Directed Acyclic Word Graph, as described on my blog at http://stevehanov.ca/blog/?id=115 It is designed to be as memory efficient as possible.
+# DAWG of DAFSA with compact alphabet
+
+Package dafsa is an implemention of a Directed Acyclic Word Graph,
+minimized version of DAFSA (Deterministic Acyclic Finite State Automaton),
+as described on [Steve Hanov's Blog](http://stevehanov.ca/blog/?id=115).
+It is designed to be as memory efficient as possible.
 
 Download:
+
 ```shell
-go get github.com/smhanov/dawg
+go get github.com/iliadenisov/dafsa
 ```
 
 * * *
-Package dawg is an implemention of a Directed Acyclic Word Graph, as described
-on my blog at http://stevehanov.ca/blog/?id=115
+Package dafsa is an implemention of a Directed Acyclic Word Graph, as described
+[Steve Hanov's Blog](http://stevehanov.ca/blog/?id=115).
 
 A DAWG provides fast lookup of all possible prefixes of words in a dictionary, as well
 as the ability to get the index number of any word.
@@ -38,9 +42,9 @@ When opened from disk, no memory is used. The structure is accessed in-place on 
 
 There are some benchmarks in this project:
 
-https://github.com/timurgarif/go-fsa-trie-bench
+[https://github.com/timurgarif/go-fsa-trie-bench](https://github.com/timurgarif/go-fsa-trie-bench)
 
-The library is optimized to take less memory or no-memory if accessing a file. We easily beat all 
-the alternatives in this area, using only 520KB compared to others which take from 3.6MB to 32MB 
-to store the same dictionary. However, the tradeoff is that  the bit-level accesses cause it to 
-take 10X as along to lookup words. 
+The library is optimized to take less memory or no-memory if accessing a file. We easily beat all
+the alternatives in this area, using only 520KB compared to others which take from 3.6MB to 32MB
+to store the same dictionary. However, the tradeoff is that  the bit-level accesses cause it to
+take 10X as along to lookup words.

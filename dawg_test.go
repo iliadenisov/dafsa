@@ -3,20 +3,13 @@ package dawg_test
 import (
 	"bufio"
 	"fmt"
-	"log"
 	"os"
+	"path/filepath"
 	"sort"
 	"testing"
 
-	"github.com/smhanov/dawg"
+	dawg "github.com/iliadenisov/dafsa"
 )
-
-func testsWords() []string {
-	return []string{
-		"hello",
-		"jellow",
-	}
-}
 
 func createDawg(words []string) dawg.Finder {
 	dawg := dawg.New()
@@ -37,34 +30,31 @@ func testDawg(t *testing.T, dawg dawg.Finder, words []string) {
 		index := dawg.IndexOf(word)
 
 		if index != i {
-			log.Panicf("Index returned should be %v, not %v", i, index)
+			t.Fatalf("Index returned should be %v, not %v", i, index)
 		}
 
 		wordFound, _ := dawg.AtIndex(i)
 		if wordFound != word {
-			log.Panicf("AtIndex(%d) should be %s, not %s", i, word, wordFound)
+			t.Fatalf("AtIndex(%d) should be %s, not %s", i, word, wordFound)
 		}
 	}
 }
 
 func runTest(t *testing.T, words []string) dawg.Finder {
+	d := t.ArtifactDir()
+	path := filepath.Join(d, "test.dawg")
+
 	finder := createDawg(words)
-	//finder.Print()
 	testDawg(t, finder, words)
 
-	// Now try the disk version
-	_, err := finder.Save("test.dawg")
+	_, err := finder.Save(path)
 	if err != nil {
-		log.Panic(err)
+		t.Fatal(err)
 	}
 
-	//f, err := os.Open("test.dawg")
-	//dawg.DumpFile(f)
-	//f.Close()
-
-	saved, err := dawg.Load("test.dawg")
+	saved, err := dawg.Load(path)
 	if err != nil {
-		log.Panic(err)
+		t.Fatal(err)
 	}
 
 	testDawg(t, saved, words)
@@ -143,7 +133,7 @@ func readDictWords(t *testing.T) []string {
 
 	file, err := os.Open(dict)
 	if err != nil {
-		log.Fatal(err)
+		t.Fatal(err)
 	}
 	defer file.Close()
 
