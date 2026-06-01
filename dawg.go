@@ -7,6 +7,8 @@ import (
 	"io"
 	"log"
 	"strconv"
+
+	"github.com/iliadenisov/alphabet"
 )
 
 // FindResult is the result of a lookup in the d. It
@@ -17,13 +19,21 @@ type FindResult struct {
 	Index int
 }
 
+// FindResultB is the index-based counterpart of FindResult returned by
+// FindAllPrefixesOfB. Word aliases the query slice passed to that method, so
+// copy it if you need to retain it beyond the call.
+type FindResultB struct {
+	Word  []byte
+	Index int
+}
+
 type edgeStart struct {
 	node int
-	ch   rune
+	ch   byte // alphabet index of the edge character
 }
 
 func (edge edgeStart) String() string {
-	return fmt.Sprintf("(%d, '%c')", edge.node, edge.ch)
+	return fmt.Sprintf("(%d, #%d)", edge.node, edge.ch)
 }
 
 type edgeEnd struct {
@@ -33,7 +43,7 @@ type edgeEnd struct {
 
 type uncheckedNode struct {
 	parent int
-	ch     rune
+	ch     byte
 	child  int
 }
 
@@ -41,6 +51,11 @@ type uncheckedNode struct {
 // all prefixes stored in the DAWG. If final is true, the prefix
 // represents a complete word that has been stored.
 type EnumFn = func(index int, word []rune, final bool) EnumerationResult
+
+// EnumFnB is the index-based counterpart of EnumFn used by EnumerateB.
+// word holds alphabet indexes and is reused between calls; copy it if you need
+// to retain it.
+type EnumFnB = func(index int, word []byte, final bool) EnumerationResult
 
 // EnumerationResult is returned by the enumeration function to indicate whether
 // indication should continue below this depth or to stop altogether
@@ -59,17 +74,40 @@ const (
 
 // Finder is the interface for querying a dawg. Use either
 // Builder.Finish() or Load() to obtain one.
+//
+// Each method comes in two forms: a string form that encodes/decodes through the
+// alphabet (convenient), and a *B form that works directly on alphabet
+// indexes (fast, no per-call encoding). Use the *B form on hot paths when
+// you already hold indexes.
 type Finder interface {
-	// Find all prefixes of the given string
-	FindAllPrefixesOf(input string) []FindResult
+	// FindAllPrefixesOf finds all stored words that are a prefix of input. It
+	// returns an error if input contains a character outside the alphabet.
+	FindAllPrefixesOf(input string) ([]FindResult, error)
 
-	// Find the index of the given string
-	IndexOf(input string) int
+	// FindAllPrefixesOfB is the index-based form of FindAllPrefixesOf.
+	FindAllPrefixesOfB(word []byte) []FindResultB
 
+	// IndexOf returns the insertion index of input, or (-1, nil) if it was never
+	// added. It returns an error if input contains a character outside the
+	// alphabet.
+	IndexOf(input string) (int, error)
+
+	// IndexOfB is the index-based form of IndexOf. It returns -1 if the word
+	// was never added.
+	IndexOfB(word []byte) int
+
+	// AtIndex returns the word stored at the given insertion index.
 	AtIndex(index int) (string, error)
+
+	// AtIndexB is the index-based form of AtIndex, returning alphabet
+	// indexes.
+	AtIndexB(index int) ([]byte, error)
 
 	// Enumerate all prefixes stored in the dawg.
 	Enumerate(fn EnumFn)
+
+	// EnumerateB is the index-based form of Enumerate.
+	EnumerateB(fn EnumFnB)
 
 	// Returns the number of words
 	NumAdded() int
@@ -96,11 +134,19 @@ type Finder interface {
 
 // Builder is the interface for creating a new Dawg. Use New() to create it.
 type Builder interface {
-	// Add the word to the dawg
-	Add(wordIn string)
+	// Add the word to the dawg. It returns an error if the dawg is finished,
+	// the word contains a character outside the alphabet, or the word does not
+	// order strictly after the previously added word by alphabet index.
+	Add(word string) error
 
-	// Returns true if the word can be added.
+	// AddB is the index-based form of Add, taking alphabet indexes directly.
+	AddB(word []byte) error
+
+	// CanAdd reports whether Add(word) would succeed.
 	CanAdd(word string) bool
+
+	// CanAddB reports whether AddB(word) would succeed.
+	CanAddB(word []byte) bool
 
 	// Complete the dawg and return a Finder.
 	Finish() Finder
@@ -116,8 +162,17 @@ type node struct {
 
 // dawg represents a Directed Acyclic Word Graph
 type dawg struct {
+	// indexer maps alphabet characters to compact byte indexes and back. It
+	// constrains which characters may be added or searched and defines the
+	// ordering used throughout the graph.
+	indexer alphabet.Indexer
+
+	// decoder maps an alphabet index back to its rune in O(1). It is built for
+	// finders (after Finish or Load) and is nil on a builder.
+	decoder []rune
+
 	// these are erased after we finish building
-	lastWord       []rune
+	lastWord       []byte
 	nextID         int
 	uncheckedNodes []uncheckedNode
 	minimizedNodes map[string]int
@@ -139,9 +194,12 @@ type dawg struct {
 	hasEmptyWord    bool
 }
 
-// New creates a new dawg
-func New() Builder {
+// New creates a new dawg Builder that uses indexer to encode and order the
+// words it is given. Every word added to the builder, and later searched in the
+// resulting Finder, must consist of characters from indexer's alphabet.
+func New(indexer alphabet.Indexer) Builder {
 	return &dawg{
+		indexer:        indexer,
 		nextID:         1,
 		minimizedNodes: make(map[string]int),
 		nodes: map[int]*node{
@@ -150,24 +208,58 @@ func New() Builder {
 	}
 }
 
-// CanAdd will return true if the word can be added to the d.
-// Words must be added in alphabetical order.
+// CanAdd reports whether word can be added: the dawg must be unfinished, word
+// must encode in the alphabet, and it must order strictly after the previously
+// added word by alphabet index.
 func (d *dawg) CanAdd(word string) bool {
-	return !d.finished &&
-		(d.numAdded == 0 || word > string(d.lastWord))
+	if d.finished {
+		return false
+	}
+	idx, err := d.indexer.Encode(word)
+	if err != nil {
+		return false
+	}
+	return d.CanAddB(idx)
 }
 
-// Add adds a word to the structure.
-// Adding a word not in alphaetical order, or to a finished dawg will panic.
-func (d *dawg) Add(wordIn string) {
-	if d.numAdded > 0 && wordIn <= string(d.lastWord) {
-		log.Printf("Last word=%s newword=%s", string(d.lastWord), wordIn)
-		panic(errors.New("d.AddWord(): Words not in alphabetical order"))
-	} else if d.finished {
-		panic(errors.New("d.AddWord(): Tried to add to a finished dawg"))
+// CanAddB is the index-based form of CanAdd.
+func (d *dawg) CanAddB(word []byte) bool {
+	if d.finished {
+		return false
+	}
+	if !d.indexesInRange(word) {
+		return false
+	}
+	return d.numAdded == 0 || bytes.Compare(word, d.lastWord) > 0
+}
+
+// Add adds a word to the structure. It returns an error if the dawg is already
+// finished, if word contains a character outside the alphabet, or if word does
+// not order strictly after the previously added word by alphabet index.
+func (d *dawg) Add(wordIn string) error {
+	word, err := d.indexer.Encode(wordIn)
+	if err != nil {
+		return fmt.Errorf("dawg: cannot add %q: %w", wordIn, err)
+	}
+	return d.AddB(word)
+}
+
+// AddB adds a word given directly as alphabet indexes. The same ordering and
+// uniqueness rules as Add apply. word must not be modified until the next
+// AddB call or Finish, as the builder keeps it as the previous word.
+func (d *dawg) AddB(word []byte) error {
+	if d.finished {
+		return errors.New("dawg: Add called on a finished dawg")
+	}
+	if !d.indexesInRange(word) {
+		return fmt.Errorf("dawg: word contains an index outside the alphabet of size %d", d.indexer.Size())
 	}
 
-	word := []rune(wordIn)
+	if d.numAdded > 0 && bytes.Compare(word, d.lastWord) <= 0 {
+		last, _ := d.indexer.Decode(d.lastWord)
+		now, _ := d.indexer.Decode(word)
+		return fmt.Errorf("dawg: words must be added in increasing alphabet order: last=%q new=%q", last, now)
+	}
 
 	// find common prefix between word and previous word
 	commonPrefix := 0
@@ -202,6 +294,18 @@ func (d *dawg) Add(wordIn string) {
 	d.setFinal(node)
 	d.lastWord = word
 	d.numAdded++
+	return nil
+}
+
+// indexesInRange reports whether every index in word is a valid alphabet index.
+func (d *dawg) indexesInRange(word []byte) bool {
+	size := d.indexer.Size()
+	for _, ix := range word {
+		if int(ix) >= size {
+			return false
+		}
+	}
+	return true
 }
 
 // Finish will mark the dawg as complete. The dawg cannot be used for lookups
@@ -225,12 +329,24 @@ func (d *dawg) Finish() Finder {
 		d.renumber()
 
 		var buffer bytes.Buffer
-		d.size, _ = d.Write(&buffer)
+		size, err := d.Write(&buffer)
+		if err != nil {
+			// Writing to an in-memory buffer cannot fail for a finished dawg;
+			// a failure here is an internal invariant violation.
+			panic(fmt.Errorf("dawg: internal error serializing the dawg: %w", err))
+		}
+		d.size = size
 		d.r = bytes.NewReader(buffer.Bytes())
 		d.nodes = nil
 	}
 
-	finder, _ := Read(d.r, 0)
+	// Carry the live indexer into the finder directly. This keeps custom
+	// (non-embedded) alphabets usable in memory, since Read can only
+	// reconstruct embedded alphabets from the stored language code.
+	finder, err := read(d.r, 0, d.indexer)
+	if err != nil {
+		panic(fmt.Errorf("dawg: internal error reopening the dawg: %w", err))
+	}
 
 	return finder
 }
@@ -276,77 +392,100 @@ func (d *dawg) Print() {
 
 // FindAllPrefixesOf returns all items in the dawg that are a prefix of the input string.
 // It will panic if the dawg is not finished.
-func (d *dawg) FindAllPrefixesOf(input string) []FindResult {
-
+func (d *dawg) FindAllPrefixesOf(input string) ([]FindResult, error) {
 	d.checkFinished()
 
-	var results []FindResult
+	word, err := d.indexer.Encode(input)
+	if err != nil {
+		return nil, fmt.Errorf("dawg: cannot search %q: %w", input, err)
+	}
+
+	byteResults := d.FindAllPrefixesOfB(word)
+	if len(byteResults) == 0 {
+		return nil, nil
+	}
+
+	results := make([]FindResult, len(byteResults))
+	for i, br := range byteResults {
+		w, derr := d.decode(br.Word)
+		if derr != nil {
+			return nil, derr
+		}
+		results[i] = FindResult{Word: w, Index: br.Index}
+	}
+	return results, nil
+}
+
+// FindAllPrefixesOfB is the index-based form of FindAllPrefixesOf. Each
+// result's Word aliases a prefix of word.
+func (d *dawg) FindAllPrefixesOfB(word []byte) []FindResultB {
+	var results []FindResultB
 	skipped := 0
 	final := d.hasEmptyWord
 	node := rootNode
-	var edgeEnd edgeEnd
+	var ee edgeEnd
 	var ok bool
 
 	r := newBitSeeker(d.r)
 
 	// for each character of the input
-	for pos, letter := range input {
+	for pos, ix := range word {
 		// if the node is final, add a result
 		if final {
-			results = append(results, FindResult{
-				Word:  input[:pos],
-				Index: skipped,
-			})
+			results = append(results, FindResultB{Word: word[:pos], Index: skipped})
 		}
 
 		// check if there is an outgoing edge for the letter
-		edgeEnd, final, ok = d.getEdge(&r, edgeStart{node: node, ch: letter})
+		ee, final, ok = d.getEdge(&r, edgeStart{node: node, ch: ix})
 		if !ok {
 			return results
 		}
 
 		// we found an edge.
-		node = edgeEnd.node
-		skipped += edgeEnd.count
+		node = ee.node
+		skipped += ee.count
 	}
 
 	if final {
-		results = append(results, FindResult{
-			Word:  input,
-			Index: skipped,
-		})
+		results = append(results, FindResultB{Word: word, Index: skipped})
 	}
 
 	return results
 }
 
 // IndexOf returns the index, which is the order the item was inserted.
-// If the item was never inserted, it returns -1
-// It will panic if the dawg is not finished.
-func (d *dawg) IndexOf(input string) int {
+// If the item was never inserted, it returns (-1, nil). It returns an error if
+// input contains a character outside the alphabet.
+func (d *dawg) IndexOf(input string) (int, error) {
+	word, err := d.indexer.Encode(input)
+	if err != nil {
+		return -1, fmt.Errorf("dawg: cannot look up %q: %w", input, err)
+	}
+	return d.IndexOfB(word), nil
+}
+
+// IndexOfB is the index-based form of IndexOf. An index outside the alphabet
+// simply will not match, yielding -1.
+func (d *dawg) IndexOfB(word []byte) int {
 	skipped := 0
 	node := rootNode
 	final := d.hasEmptyWord
 	var ok bool
-	var edgeEnd edgeEnd
+	var ee edgeEnd
 	r := newBitSeeker(d.r)
 
-	// for each character of the input
-	for _, letter := range input {
-		// check if there is an outgoing edge for the letter
-		edgeEnd, final, ok = d.getEdge(&r, edgeStart{node: node, ch: letter})
-		//log.Printf("Follow %v:%v=>%v (ok=%v)", node, string(letter), edgeEnd.node, ok)
+	for _, ix := range word {
+		ee, final, ok = d.getEdge(&r, edgeStart{node: node, ch: ix})
 		if !ok {
 			// not found
 			return -1
 		}
 
 		// we found an edge.
-		node = edgeEnd.node
-		skipped += edgeEnd.count
+		node = ee.node
+		skipped += ee.count
 	}
 
-	//log.Printf("IsFinal %d: %v", node, final)
 	if final {
 		return skipped
 	}
@@ -373,6 +512,34 @@ func (d *dawg) checkFinished() {
 	if !d.finished {
 		panic(errors.New("dawg was not Finished()"))
 	}
+}
+
+// buildDecoder fills d.decoder so that an alphabet index maps to its rune in
+// O(1). Alphabet indexes are contiguous in the range [0, Size).
+func (d *dawg) buildDecoder() {
+	size := d.indexer.Size()
+	d.decoder = make([]rune, size)
+	for i := range size {
+		s, err := d.indexer.Character(byte(i))
+		if err != nil {
+			continue
+		}
+		if rs := []rune(s); len(rs) > 0 {
+			d.decoder[i] = rs[0]
+		}
+	}
+}
+
+// decode turns alphabet indexes back into a string using the decoder table.
+func (d *dawg) decode(indexes []byte) (string, error) {
+	runes := make([]rune, len(indexes))
+	for i, idx := range indexes {
+		if int(idx) >= len(d.decoder) {
+			return "", fmt.Errorf("dawg: alphabet index %d out of range", idx)
+		}
+		runes[i] = d.decoder[idx]
+	}
+	return string(runes), nil
 }
 
 func (d *dawg) minimize(downTo int) {
@@ -404,7 +571,7 @@ func (d *dawg) nameOf(nodeid int) string {
 	buff := bytes.Buffer{}
 	for _, edge := range node.edges {
 		buff.WriteByte('_')
-		buff.WriteRune(edge.ch)
+		buff.WriteByte(edge.ch)
 		buff.WriteByte(':')
 		buff.WriteString(strconv.Itoa(edge.node))
 	}
@@ -423,8 +590,7 @@ func (d *dawg) setFinal(node int) {
 	}
 }
 
-func (d *dawg) addChild(parent int, ch rune, child int) {
-	//log.Printf("Addchild %v(%v)->%v", parent, string(ch), child)
+func (d *dawg) addChild(parent int, ch byte, child int) {
 	d.numEdges++
 	if d.nodes[child] == nil {
 		d.nodes[child] = &node{
@@ -438,23 +604,16 @@ func (d *dawg) addChild(parent int, ch rune, child int) {
 	node.edges = append(node.edges, edgeStart{child, ch})
 }
 
-func (d *dawg) replaceChild(parent int, ch rune, child int) {
+func (d *dawg) replaceChild(parent int, ch byte, child int) {
 	pnode := d.nodes[parent]
-	//TODO: should be bsearch
+
 	i := bsearch(len(pnode.edges), func(i int) int {
-		return int(pnode.edges[i].ch - ch)
+		return int(pnode.edges[i].ch) - int(ch)
 	})
 
 	if pnode.edges[i].ch != ch {
-		//for _, edge := range pnode.edges {
-		//	log.Printf("Edge %c %d", rune(edge.ch), edge.node)
-		//}
-		log.Panicf("Not found: %c", ch)
+		log.Panicf("Not found: #%d", ch)
 	}
-
-	//log.Printf("ReplaceChild(%v:%v=>%v, %v:%v=>%v)",
-	//	parent, string(ch), pnode.edges[i].node,
-	//	parent, string(ch), child)
 
 	delete(d.nodes, pnode.edges[i].node)
 	pnode.edges[i].node = child
@@ -490,31 +649,45 @@ func (d *dawg) calculateSkipped(nodeid int) int {
 // Enumerate will call the given method, passing it every possible prefix of words in the index.
 // Return Continue to continue enumeration, Skip to skip this branch, or Stop to stop enumeration.
 func (d *dawg) Enumerate(fn EnumFn) {
+	// reuse one rune buffer across calls; the decoded prefix is rebuilt from the
+	// byte prefix each call.
+	var runes []rune
+	d.EnumerateB(func(index int, word []byte, final bool) EnumerationResult {
+		runes = runes[:0]
+		for _, b := range word {
+			runes = append(runes, d.decoder[b])
+		}
+		return fn(index, runes, final)
+	})
+}
+
+// EnumerateB is the index-based form of Enumerate.
+func (d *dawg) EnumerateB(fn EnumFnB) {
 	r := newBitSeeker(d.r)
 	d.enumerate(&r, 0, rootNode, nil, fn)
 }
 
-func (d *dawg) enumerate(r *bitSeeker, index int, address int, runes []rune, fn EnumFn) EnumerationResult {
+func (d *dawg) enumerate(r *bitSeeker, index int, address int, word []byte, fn EnumFnB) EnumerationResult {
 	// get the node and whether its final
 	node := d.getNode(r, address)
 
-	// call the enum function on the runes
-	result := fn(index, runes, node.final)
+	// call the enum function on the prefix
+	result := fn(index, word, node.final)
 
 	// if the function didn't say to continue, then return.
 	if result != Continue {
 		return result
 	}
 
-	l := len(runes)
-	runes = append(runes, 0)
+	l := len(word)
+	word = append(word, 0)
 
 	// for each edge
 	for _, edge := range node.edges {
-		// add ch to the runes
-		runes[l] = edge.ch
+		// add the index to the prefix
+		word[l] = edge.ch
 		// recurse
-		result = d.enumerate(r, index+edge.count, edge.node, runes, fn)
+		result = d.enumerate(r, index+edge.count, edge.node, word, fn)
 		if result == Stop {
 			break
 		}
@@ -523,29 +696,31 @@ func (d *dawg) enumerate(r *bitSeeker, index int, address int, runes []rune, fn 
 	return result
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
+func (d *dawg) AtIndex(index int) (string, error) {
+	word, err := d.AtIndexB(index)
+	if err != nil {
+		return "", err
 	}
-	return b
+	return d.decode(word)
 }
 
-func (d *dawg) AtIndex(index int) (string, error) {
+// AtIndexB is the index-based form of AtIndex, returning alphabet indexes.
+func (d *dawg) AtIndexB(index int) ([]byte, error) {
 	if index < 0 || index >= d.NumAdded() {
-		return "", errors.New("invalid index")
+		return nil, errors.New("invalid index")
 	}
 
 	r := newBitSeeker(d.r)
-	// start at first node and empty string
+	// start at first node and empty word
 	result, _ := d.atIndex(&r, rootNode, 0, index, nil)
 	return result, nil
 }
 
-func (d *dawg) atIndex(r *bitSeeker, nodeNumber, atIndex, targetIndex int, runes []rune) (string, bool) {
+func (d *dawg) atIndex(r *bitSeeker, nodeNumber, atIndex, targetIndex int, indexes []byte) ([]byte, bool) {
 	node := d.getNode(r, nodeNumber)
 	// if node is final and index matches, return it
 	if node.final && atIndex == targetIndex {
-		return string(runes), true
+		return indexes, true
 	}
 
 	next := bsearch(len(node.edges), func(i int) int {
@@ -556,14 +731,13 @@ func (d *dawg) atIndex(r *bitSeeker, nodeNumber, atIndex, targetIndex int, runes
 		next--
 	}
 
-	//log.Printf("Follow edge %v %c skip=%d", node.edges[next], node.edges[next].ch, node.edges[next].count)
-	runes = append(runes, 0)
+	indexes = append(indexes, 0)
 	for i := next; i < len(node.edges); i++ {
-		runes[len(runes)-1] = node.edges[i].ch
-		if result, ok := d.atIndex(r, node.edges[i].node, atIndex+node.edges[i].count, targetIndex, runes); ok {
+		indexes[len(indexes)-1] = node.edges[i].ch
+		if result, ok := d.atIndex(r, node.edges[i].node, atIndex+node.edges[i].count, targetIndex, indexes); ok {
 			return result, ok
 		}
 	}
-	return "", false
+	return nil, false
 
 }
